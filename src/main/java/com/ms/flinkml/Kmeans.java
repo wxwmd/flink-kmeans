@@ -1,5 +1,6 @@
 package com.ms.flinkml;
 
+import org.apache.flink.api.common.functions.FlatJoinFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.functions.RichMapFunction;
@@ -20,26 +21,50 @@ import java.util.Random;
  */
 public class Kmeans {
     public static void main(String[] args) throws Exception {
-        ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+        ExecutionEnvironment env = ExecutionEnvironment.createLocalEnvironment(1);
         String path = Objects.requireNonNull(Kmeans.class.getClassLoader().getResource("iris.csv")).getPath();
         DataSource<Iris> irisDataSource = env.readCsvFile(path)
                 .pojoType(Iris.class, "f1", "f2", "f3", "f4", "category");
 
         DataSource<Iris> centers = env.fromCollection(initCenters(3));
 
-        IterativeDataSet<Iris> iterateCenters = centers.iterate(20);
+        IterativeDataSet<Iris> iterateCenters = centers.iterate(10);
 
-        DataSet<Iris> newCenters = irisDataSource.map(new GetNearestCenter())
+        DataSet<Iris> newCenters = irisDataSource.map(new GetNearestCenter("centers"))
                 .withBroadcastSet(iterateCenters, "centers")
                 .groupBy(x -> x.f1)
                 .reduce(new GetNetCenters1())
                 .map(new GetNewCenters2());
+        
+        /*
+        设置Kmeans算法停止条件
+        一旦每个节点所属类别不再变化，那我们停止聚类
+         */
+        DataSet<Tuple3<Iris, Integer, Integer>> oldCluster = irisDataSource.map(new GetNearestCenter("centers"))
+                .withBroadcastSet(iterateCenters, "centers");
+        DataSet<Tuple3<Iris, Integer, Integer>> newCluster = irisDataSource.map(new GetNearestCenter("newCenters"))
+                .withBroadcastSet(newCenters, "newCenters");
 
-        DataSet<Iris> resultCenters = iterateCenters.closeWith(newCenters);
+        DataSet<Object> terminationCriterion = oldCluster.join(newCluster)
+                .where(x -> x.f0)
+                .equalTo(y -> y.f0)
+                .with((FlatJoinFunction<Tuple3<Iris, Integer, Integer>, Tuple3<Iris, Integer, Integer>, Object>) (irisIntegerIntegerTuple3, irisIntegerIntegerTuple32, collector) -> {
+                    /*
+                    如果使用老的中心点得到的簇id 和 新的中心点得到的簇id不同
+                    那么就加入到terminationCriterion中
+                    表明循环还不应该结束
+                     */
+                    if (!irisIntegerIntegerTuple3.f1.equals(irisIntegerIntegerTuple32.f1)) {
+                        collector.collect(irisIntegerIntegerTuple3.f0);
+                    }
+                });
+
+
+        DataSet<Iris> resultCenters = iterateCenters.closeWith(newCenters, terminationCriterion);
 
         resultCenters.print();
 
-        irisDataSource.map(new GetNearestCenter())
+        irisDataSource.map(new GetNearestCenter("centers"))
                 .withBroadcastSet(resultCenters,"centers")
                 .print();
     }
@@ -70,13 +95,20 @@ public class Kmeans {
      * f2: 没啥实际意义，为了下面计算中心点做准备
      */
     static class GetNearestCenter extends RichMapFunction<Iris, Tuple3<Iris,Integer,Integer>>{
+        String broadcastName;
         List<Iris> centers;
+
+        public GetNearestCenter(String broadcastName) {
+            this.broadcastName = broadcastName;
+        }
 
         @Override
         public void open(Configuration parameters) throws Exception {
             super.open(parameters);
             centers = new ArrayList<>();
-            centers = getRuntimeContext().getBroadcastVariable("centers");
+            centers = getRuntimeContext().getBroadcastVariable(broadcastName);
+            System.out.println(broadcastName);
+            centers.forEach(System.out::println);
         }
 
         @Override
